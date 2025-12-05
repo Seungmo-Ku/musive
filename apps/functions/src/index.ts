@@ -167,7 +167,7 @@ const transporter = nodemailer.createTransport({
 
 export const sendDailyMusicNews = onSchedule(
     {
-        schedule: '0 7 * * *',
+        schedule: '0 9 * * *',
         timeZone: 'Asia/Seoul',
         region: 'asia-northeast3',
         timeoutSeconds: 540,
