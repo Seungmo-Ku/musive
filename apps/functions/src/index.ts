@@ -1,6 +1,4 @@
-import dotenv from "dotenv"
-dotenv.config()
-
+import dotenv from 'dotenv'
 import { onSchedule } from 'firebase-functions/v2/scheduler'
 import { onRequest } from 'firebase-functions/v2/https'
 import * as logger from 'firebase-functions/logger'
@@ -10,6 +8,8 @@ import Parser from 'rss-parser'
 import * as cheerio from 'cheerio'
 import OpenAI from 'openai'
 
+
+dotenv.config()
 
 admin.initializeApp()
 const db = admin.firestore()
@@ -41,7 +41,19 @@ interface UserData {
     isSubscribed: boolean
 }
 
-async function analyzeNewsWithAI(title: string, rawText: string): Promise<{ isValid: boolean, summary: string, interestLevel?: number }> {
+interface AnalyzeRequest {
+    title: string
+    rawText: string
+}
+
+interface AnalyzeResponse {
+    isValid: boolean
+    summary: string
+    interestLevel?: number
+}
+
+async function analyzeNewsWithAI(request: AnalyzeRequest): Promise<AnalyzeResponse> {
+    const { title, rawText } = request
     try {
         const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -87,6 +99,64 @@ async function analyzeNewsWithAI(title: string, rawText: string): Promise<{ isVa
     }
 }
 
+async function removeDuplicateNews(items: NewsItem[]): Promise<NewsItem[]> {
+    try {
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                {
+                    role: 'system',
+                    content: `
+                    너는 음악 뉴스 큐레이터가 가져온 기사 중 중복되는 기사를 제거해야 해.
+                    다음 기준에 따라 겹치는 기사를 판단해줘.
+
+                    [판단 기준]
+                    같은 사건/이슈에 대해 다루고 있는 기사들은 중복으로 간주해.
+                    예를 들어, 동일한 앨범 발매 소식이나 투어 발표를 다룬 기사들은 중복이야.
+                    반면, 같은 아티스트라도 다른 사건/이슈를 다룬 기사들은 중복이 아니야.
+                    중복 된 기사 중 무엇을 남길지 판단할 때
+                    1. thumbnail 이미지가 있는 기사 우선
+                    2. interestLevel이 높은 기사 우선
+                    순으로 고려해줘.
+
+                    [응답 규칙]
+                    Input 은
+                    interface NewsItem {
+                        source: string
+                        title: string
+                        link: string
+                        summary: string
+                        thumbnail: string
+                        pubDate: Date
+                        interestLevel: number
+                    } 의 배열을 JSON.stringify 한 문자열이야.
+                    Output 은 제거할 기사들의 index 배열을 indicesToRemove 라는 키로 반환해줘.
+                    
+                    응답 형식(JSON): { "indicesToRemove": number[] }
+                    `
+                },
+                {
+                    role: 'user',
+                    content: `다음 뉴스 기사들 중복 제거해줘:\n${JSON.stringify(items)}
+                    `
+                }
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.3 // 분석은 냉정하게
+        })
+        
+        const result = JSON.parse(completion.choices[0].message.content || '{}')
+        if (!result.indicesToRemove || !Array.isArray(result.indicesToRemove)) {
+            return items
+        }
+
+        return items.filter((_, index) => !result.indicesToRemove.includes(index))
+    } catch (error) {
+        logger.error('AI 분석 에러:', error)
+        return items
+    }
+}
+
 // 개별 소스 수집
 async function fetchNewsFromSource(sourceName: string, rssUrl: string, parser: Parser): Promise<NewsItem[]> {
     try {
@@ -97,7 +167,7 @@ async function fetchNewsFromSource(sourceName: string, rssUrl: string, parser: P
         const candidates = feed.items.filter((item) => {
             const pubDate = new Date(item.pubDate!)
             return pubDate > yesterday
-        }).slice(0, 20)
+        }).slice(0, 50)
         
         // Promise.all로 동시에 검사
         const results = await Promise.all(candidates.map(async (item) => {
@@ -116,7 +186,9 @@ async function fetchNewsFromSource(sourceName: string, rssUrl: string, parser: P
             const $ = cheerio.load(item['content:encoded'] || item.content || item.summary || '')
             const rawText = $.text().replace(/\s\s+/g, ' ').trim().substring(0, 600)
             
-            const aiResult = await analyzeNewsWithAI(item.title || '', rawText)
+            const aiResult = await analyzeNewsWithAI({
+                title: item.title || '', rawText
+            })
             
             if (aiResult.isValid) {
                 return {
@@ -149,10 +221,18 @@ async function getAllMusicNews(): Promise<NewsItem[]> {
     ))
     
     // 중요도 및 최신순 정렬
-    const allNews = results.flat().sort((a, b) => (b.interestLevel ?? 0) - (a.interestLevel ?? 0) || b.pubDate.getTime() - a.pubDate.getTime())
+    const allNews = results.flat()
+    
+    const uniqueNews = await removeDuplicateNews(allNews)
+    uniqueNews.sort((a, b) => {
+        if (b.interestLevel! === a.interestLevel!) {
+            return b.pubDate.getTime() - a.pubDate.getTime()
+        }
+        return (b.interestLevel! || 0) - (a.interestLevel! || 0)
+    })
     
     // 15개 필터링
-    return allNews.slice(0, 15)
+    return uniqueNews.slice(0, 15)
 }
 
 export const testCrawler = onRequest(async (req, res) => {
